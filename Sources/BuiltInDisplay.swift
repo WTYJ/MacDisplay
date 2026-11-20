@@ -36,33 +36,46 @@ private final class DisplayConnectionAPI {
         #endif
     }
 
-    private func displayIDs() -> [CGDirectDisplayID] {
+    private func displayIDs() -> [CGDirectDisplayID]? {
         var ids = [CGDirectDisplayID](repeating: 0, count: 32)
         var count: UInt32 = 0
-        guard enumerate(UInt32(ids.count), &ids, &count) == 0 else { return [] }
+        guard enumerate(UInt32(ids.count), &ids, &count) == 0 else { return nil }
         return ids.prefix(Int(count)).filter { $0 != 0 }
     }
 
     func builtInID() -> CGDirectDisplayID? {
-        let builtIn = displayIDs().filter { CGDisplayIsBuiltin($0) != 0 }
+        guard let builtIn = displayIDs()?.filter({ CGDisplayIsBuiltin($0) != 0 }) else { return nil }
         return builtIn.count == 1 ? builtIn[0] : nil
     }
 
     func externalID(uuid: String) -> CGDirectDisplayID? {
-        let matches = displayIDs().filter { Display.identifier(for: $0) == uuid }
-        guard matches.count == 1, let id = matches.first, CGDisplayIsBuiltin(id) == 0 else { return nil }
+        guard let matches = displayIDs()?.filter({ Display.identifier(for: $0) == uuid }),
+              matches.count == 1, let id = matches.first, CGDisplayIsBuiltin(id) == 0 else { return nil }
         return id
+    }
+
+    func isExternalMissing(uuid: String, originalID: CGDirectDisplayID) -> Bool {
+        guard let ids = displayIDs() else { return false }
+        return ids.allSatisfy { id in
+            if let identifier = Display.identifier(for: id) { return identifier != uuid }
+            return id != originalID
+        }
     }
 
     func isUsableExternal(_ display: Display) -> Bool {
         CGDisplayIsAsleep(display.id) == 0 && CGDisplayIsInMirrorSet(display.id) == 0
-            && isPhysicalExternal(display.id)
+            && physicalExternalLocation(display.id) != nil
     }
 
-    private func isPhysicalExternal(_ id: CGDirectDisplayID) -> Bool {
+    func physicalExternalLocation(_ id: CGDirectDisplayID) -> String? {
         guard id != 0, CGDisplayIsBuiltin(id) == 0,
               let info = displayInfo(id)?.takeRetainedValue() as? [String: Any],
-              let location = info["IODisplayLocation"] as? String else { return false }
+              let location = info["IODisplayLocation"] as? String,
+              isExternalAttached(at: location) else { return nil }
+        return location
+    }
+
+    func isExternalAttached(at location: String) -> Bool {
         let service = IORegistryEntryCopyFromPath(kIOMainPortDefault, location as CFString)
         guard service != IO_OBJECT_NULL else { return false }
         IOObjectRelease(service)
@@ -71,7 +84,7 @@ private final class DisplayConnectionAPI {
 
     func setEnabled(_ enabled: Bool, id: CGDirectDisplayID, externalUUID: String? = nil) throws {
         if let externalUUID {
-            guard externalID(uuid: externalUUID) == id, enabled || isPhysicalExternal(id) else {
+            guard externalID(uuid: externalUUID) == id, enabled || physicalExternalLocation(id) != nil else {
                 throw DisplayFailure("系统无法确认目标外接显示器。")
             }
         } else {
@@ -124,6 +137,14 @@ final class DisplayConnection: ObservableObject {
         case recoveryFailed
     }
 
+    private struct ManagedExternal {
+        let id: CGDirectDisplayID
+        let uuid: String
+        let name: String
+        let location: String
+        var wasAttachedWhileInactive = false
+    }
+
     @Published private(set) var state: State = .unavailable("正在检查显示器。")
     @Published private(set) var message: String?
 
@@ -144,7 +165,7 @@ final class DisplayConnection: ObservableObject {
     }()
 
     private var managedID: CGDirectDisplayID?
-    private var managedExternal: Display?
+    private var managedExternal: ManagedExternal?
     private var phase: Phase?
     private var monitor: Task<Void, Never>?
 
@@ -238,6 +259,18 @@ final class DisplayConnection: ObservableObject {
         }
 
         let active = displays.flatMap { activeTarget(in: $0) }
+        if let displays, active == nil, let external = managedExternal {
+            if api.isExternalAttached(at: external.location) {
+                // Verify that this registry entry survives soft disconnection before using its loss as evidence.
+                managedExternal?.wasAttachedWhileInactive = true
+            } else if external.wasAttachedWhileInactive,
+                      api.isExternalMissing(uuid: external.uuid, originalID: external.id) {
+                finish()
+                message = nil
+                refreshExternalAvailability(displays: displays, lidClosed: closed, api: api)
+                return
+            }
+        }
         let hasSurvivor = displays.map { hasSurvivor(in: $0, api: api) }
         let now = Date()
         if target == .external, closed != false {
@@ -299,7 +332,7 @@ final class DisplayConnection: ObservableObject {
                     return
                 }
                 phase = .recoveryFailed
-                stopMonitoring()
+                if target == .builtIn { stopMonitoring() }
                 message = target == .builtIn
                     ? "macOS 尚未恢复内建屏。可重试，或保持外屏连接并合盖后再开盖。"
                     : "macOS 尚未恢复\(name)。可重试，或重新插拔显示器连接线。"
@@ -313,18 +346,7 @@ final class DisplayConnection: ObservableObject {
         }
 
         if target == .external {
-            if managedExternal != nil {
-                updateState(.disconnected)
-            } else if closed != false {
-                updateState(.unavailable("请打开 MacBook 上盖。"))
-            } else if hasSurvivor != true {
-                updateState(.unavailable("请先让 MacBook 内建屏显示扩展桌面。"))
-            } else if let active, api.isUsableExternal(active),
-                      let uuid = active.uuid, api.externalID(uuid: uuid) == active.id {
-                updateState(.connected)
-            } else {
-                updateState(.unavailable("需要可软断开的实体外屏。"))
-            }
+            refreshExternalAvailability(displays: displays, lidClosed: closed, api: api)
             return
         }
 
@@ -345,19 +367,42 @@ final class DisplayConnection: ObservableObject {
         }
     }
 
+    private func refreshExternalAvailability(
+        displays: [Display]?, lidClosed: Bool?, api: DisplayConnectionAPI
+    ) {
+        if managedExternal != nil {
+            updateState(.disconnected)
+        } else if lidClosed != false {
+            updateState(.unavailable("请打开 MacBook 上盖。"))
+        } else if let displays, usableBuiltIn(in: displays) != nil {
+            if let active = Display.menuExternal(in: displays), api.isUsableExternal(active),
+               let uuid = active.uuid, api.externalID(uuid: uuid) == active.id {
+                updateState(.connected)
+            } else {
+                updateState(.unavailable("需要可软断开的实体外屏。"))
+            }
+        } else {
+            updateState(.unavailable("请先让 MacBook 内建屏显示扩展桌面。"))
+        }
+    }
+
     func disconnect(expectedExternalUUID: String? = nil) {
         let displays = try? Display.active()
         refresh(displays: displays)
         guard state == .connected, let api, let displays, let display = activeTarget(in: displays) else { return }
-        let uuid = target == .external ? display.uuid : nil
+        let external: ManagedExternal?
         if target == .external {
-            guard let uuid, uuid == expectedExternalUUID else { return }
+            guard let uuid = display.uuid, uuid == expectedExternalUUID,
+                  let location = api.physicalExternalLocation(display.id) else { return }
+            external = ManagedExternal(id: display.id, uuid: uuid, name: display.name, location: location)
+        } else {
+            external = nil
         }
         message = nil
         do {
-            try api.setEnabled(false, id: display.id, externalUUID: uuid)
-            if target == .external {
-                managedExternal = display
+            try api.setEnabled(false, id: display.id, externalUUID: external?.uuid)
+            if let external {
+                managedExternal = external
             } else {
                 managedID = display.id
             }
