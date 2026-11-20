@@ -240,10 +240,17 @@ private struct SettingsDisclosure<Content: View>: View {
 }
 
 private struct AboutControls: View {
+    private enum UpdateStatus: Equatable {
+        case idle
+        case checking
+        case finished(UpdateCheck.Result)
+        case failed
+    }
+
     private let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? ""
-    private let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
     private let license = Bundle.main.url(forResource: "m1ddc-LICENSE", withExtension: nil)
         .flatMap { try? String(contentsOf: $0, encoding: .utf8) }
+    @ViewState private var updateStatus = UpdateStatus.idle
 
     var body: some View {
         Form {
@@ -256,12 +263,33 @@ private struct AboutControls: View {
                         .accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 4) {
                         Text("MacDisplay").font(.title2.weight(.semibold))
-                        Text("版本 \(version)（构建 \(build)）")
+                        Text("版本 \(version)")
                             .foregroundStyle(.secondary)
                             .textSelection(.enabled)
                     }
                 }
                 .padding(.vertical, 4)
+            }
+
+            Section {
+                Button("检查更新") { Task { await checkForUpdates() } }
+                    .disabled(updateStatus == .checking)
+                switch updateStatus {
+                case .idle:
+                    EmptyView()
+                case .checking:
+                    ProgressView("正在检查更新…").controlSize(.small)
+                case .finished(.noRelease):
+                    Text("GitHub 上还没有正式发布的版本。").foregroundStyle(.secondary)
+                case .finished(.upToDate):
+                    Text("暂无可用更新。").foregroundStyle(.secondary)
+                case .finished(.available(let latest)):
+                    LabeledContent("有新版本 \(latest)") {
+                        Link("查看发布…", destination: UpdateCheck.latestReleasePage)
+                    }
+                case .failed:
+                    Text("无法检查更新，请稍后重试。").foregroundStyle(.secondary)
+                }
             }
 
             if let license, let source = URL(string: "https://github.com/waydabber/m1ddc") {
@@ -278,5 +306,15 @@ private struct AboutControls: View {
             }
         }
         .formStyle(.grouped)
+    }
+
+    private func checkForUpdates() async {
+        guard updateStatus != .checking else { return }
+        updateStatus = .checking
+        do {
+            updateStatus = .finished(try await UpdateCheck.check(installedVersion: version))
+        } catch {
+            updateStatus = .failed
+        }
     }
 }
