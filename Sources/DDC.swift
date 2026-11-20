@@ -1,6 +1,11 @@
+import Darwin
 import Foundation
 
 enum DDC {
+    private struct CommandTimeout: LocalizedError {
+        var errorDescription: String? { "DDC/CI 命令超时。请检查显示器连接后重试。" }
+    }
+
     enum Control: String, CaseIterable, Identifiable, Sendable {
         case luminance, contrast, volume, red, green, blue
 
@@ -43,7 +48,14 @@ enum DDC {
         guard let helper else { throw DisplayFailure("此构建未包含 DDC/CI 后端。") }
         var readings: [Control: Value] = [:]
         for control in Control.allCases {
-            readings[control] = try? readValue(helper, uuid, control)
+            do {
+                readings[control] = try readValue(helper, uuid, control)
+            } catch let timeout as CommandTimeout {
+                if readings.isEmpty { throw timeout }
+                break
+            } catch {
+                // Some displays do not support all controls.
+            }
         }
         guard !readings.isEmpty else {
             throw DisplayFailure("显示器未返回可读的 DDC/CI 控制值。请检查显示器菜单中的 DDC/CI 选项以及连接线。")
@@ -56,18 +68,20 @@ enum DDC {
             guard let helper else { throw DisplayFailure("此构建未包含 DDC/CI 后端。") }
             do {
                 return try readValue(helper, uuid, .luminance)
+            } catch let timeout as CommandTimeout {
+                throw timeout
             } catch {
                 return try readValue(helper, uuid, .luminance)
             }
         }.value
     }
 
-    static func write(uuid: String, control: Control, value: Int) async throws -> Int {
+    static func write(uuid: String, control: Control, value: Int) async throws -> Value {
         try await Task.detached(priority: .userInitiated) {
             guard let helper else { throw DisplayFailure("此构建未包含 DDC/CI 后端。") }
             _ = try run(helper, ["display", "uuid=\(uuid)", "set", control.rawValue, String(value)])
             do {
-                return try number(helper, uuid, "get", control)
+                return try readValue(helper, uuid, control)
             } catch {
                 throw DisplayFailure("已发出写入命令，但无法核对显示器当前值。请重新读取。")
             }
@@ -96,14 +110,6 @@ enum DDC {
         }.value
     }
 
-    private static func number(_ helper: URL, _ uuid: String, _ verb: String, _ control: Control) throws -> Int {
-        let output = try run(helper, ["display", "uuid=\(uuid)", verb, control.rawValue])
-        guard let value = Int(output) else {
-            throw DisplayFailure("显示器没有返回有效的\(control.label)。")
-        }
-        return value
-    }
-
     private static func readValue(_ helper: URL, _ uuid: String, _ control: Control) throws -> Value {
         let output = try run(helper, ["display", "uuid=\(uuid)", "get-value", control.rawValue])
         let fields = output.split(separator: " ")
@@ -113,15 +119,32 @@ enum DDC {
         }
         return Value(current: current, maximum: maximum)
     }
+
     private static func run(_ helper: URL, _ arguments: [String]) throws -> String {
+        let outputURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        guard FileManager.default.createFile(atPath: outputURL.path, contents: nil, attributes: [.posixPermissions: 0o600]) else {
+            throw DisplayFailure("无法创建 DDC/CI 临时输出文件。")
+        }
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+        // A file lets the helper finish even when the output exceeds a pipe buffer.
+        let output = try FileHandle(forUpdating: outputURL)
+        defer { try? output.close() }
+        let finished = DispatchSemaphore(value: 0)
         let process = Process()
-        let output = Pipe()
         process.executableURL = helper
         process.arguments = arguments
         process.standardOutput = output
+        process.terminationHandler = { _ in finished.signal() }
         try process.run()
-        let data = output.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
+        guard finished.wait(timeout: .now() + .seconds(3)) == .success else {
+            if process.isRunning { process.terminate() }
+            if finished.wait(timeout: .now() + .milliseconds(200)) == .timedOut, process.isRunning {
+                kill(process.processIdentifier, SIGKILL)
+            }
+            throw CommandTimeout()
+        }
+        try output.seek(toOffset: 0)
+        let data = try output.readToEnd() ?? Data()
         let message = String(decoding: data, as: UTF8.self).trimmingCharacters(in: .whitespacesAndNewlines)
         guard process.terminationStatus == 0 else {
             throw DisplayFailure("DDC/CI 命令失败。\(message)")

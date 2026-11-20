@@ -3,17 +3,6 @@
 #include "i2c.h"
 #include "utils.h"
 
-static int getBytesUsed(UInt8* data) {
-    int bytes = 0;
-    // Check up to DDC_BUFFER_SIZE bytes, not sizeof(data) which is just pointer size
-    for (int i = 0; i < DDC_BUFFER_SIZE; ++i) {
-        if (data[i] != 0) {
-            bytes = i + 1;
-        }
-    }
-    return bytes;
-}
-
 // Function to get ready for DDC operations for a specific display attribute
 DDCPacket createDDCPacket(UInt8 attrCode) {
     DDCPacket packet = {};
@@ -49,10 +38,12 @@ IOReturn performDDCReadAtChipAddress(IOAVServiceRef avService, UInt32 chipAddres
 
 IOReturn performDDCWriteAtChipAddress(IOAVServiceRef avService, UInt32 chipAddress, DDCPacket *packet) {
     IOReturn ret;
+    // The length byte excludes itself and the checksum, even when the checksum is zero.
+    UInt32 length = (packet->data[0] & 0x7F) + 2;
 
     for (int i = 0; i < DDC_ITERATIONS; ++i) {
         usleep(DDC_WAIT);
-        if ((ret = IOAVServiceWriteI2C(avService, chipAddress, packet->inputAddr, packet->data, getBytesUsed(packet->data)))) {
+        if ((ret = IOAVServiceWriteI2C(avService, chipAddress, packet->inputAddr, packet->data, length))) {
             return ret;
         }
     }

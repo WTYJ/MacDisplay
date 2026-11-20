@@ -7,6 +7,7 @@ private typealias ViewState<Value> = SwiftUI.State<Value>
 
 struct Controls: View {
     @ObservedObject var model: Model
+    @ObservedObject var external: DisplayConnection
 
     var body: some View {
         TabView {
@@ -82,14 +83,17 @@ struct Controls: View {
             }
             .id(model.selectedDisplayID)
 
-            BuiltInDisplayControls(display: model.builtIn, modeTrialActive: model.modeTrial != nil)
+            BuiltInDisplayControls(
+                display: model.builtIn, disconnectDisabled: model.modeTrial != nil || external.isManaged,
+                disconnect: model.disconnectBuiltIn
+            )
             Section("显示模式") {
                 if let display = model.selectedDisplay {
                     let active = display.currentMode.map(DisplayMode.init)
                     let modes = display.modes.map(DisplayMode.init)
                     if let active, !modes.isEmpty {
                         modeSelectors(active: active, modes: modes)
-                            .disabled(model.modeTrial != nil || display.uuid == nil)
+                            .disabled(model.modeTrial != nil || external.isTransitioning || display.uuid == nil)
                     } else {
                         LabeledContent("当前模式", value: display.details)
                     }
@@ -168,7 +172,7 @@ struct Controls: View {
             Section("EDID") {
                 displaySelector
                 Button("导出 EDID…") { Task { await model.exportEDID() } }
-                    .disabled(!model.canReadHardware || model.hardwareBusy)
+                    .disabled(!model.canReadHardware || model.hardwareBusy || model.isExportingEDID)
                 if !model.canReadHardware {
                     Text("请选择支持 EDID 导出的外接显示器。").foregroundStyle(.secondary)
                 }
@@ -234,15 +238,16 @@ private struct LoginLaunchControls: View {
 }
 
 private struct BuiltInDisplayControls: View {
-    @ObservedObject var display: BuiltInDisplay
-    let modeTrialActive: Bool
+    @ObservedObject var display: DisplayConnection
+    let disconnectDisabled: Bool
+    let disconnect: () -> Void
 
     var body: some View {
         Section("开盖使用外屏") {
             switch display.state {
             case .connected:
-                Button("断开 MacBook 内建屏") { display.disconnect() }
-                    .disabled(modeTrialActive)
+                Button("断开 MacBook 内建屏", action: disconnect)
+                    .disabled(disconnectDisabled)
                 Text("断开后请在外屏确认。未确认时将尝试恢复内建屏。")
                     .foregroundStyle(.secondary)
             case .disconnected:

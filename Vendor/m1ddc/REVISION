@@ -1,3 +1,4 @@
 3a21f7d83ec147ecb0bd6e0146cf3637dea64109
 Local change: export the selected adapter's EDID from IORegistry, with a DisplayPort transport lookup when needed.
 Local change: validate Get VCP replies and read the current and maximum values from a single reply.
+Local change: preserve zero checksum bytes when sending DDC/CI packets.

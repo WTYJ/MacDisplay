@@ -3,15 +3,19 @@ import SwiftUI
 
 struct MenuControls: View {
     @ObservedObject var model: Model
-    @ObservedObject var builtIn: BuiltInDisplay
+    @ObservedObject var builtIn: DisplayConnection
+    @ObservedObject var external: DisplayConnection
     let toggleBuiltIn: () -> Void
+    let toggleExternal: () -> Void
     let showSettings: () -> Void
     let quit: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            brightness
-            Divider()
+            if model.menuDisplay != nil || !external.isManaged {
+                brightness
+                Divider()
+            }
             connection
             Divider()
             HStack {
@@ -58,15 +62,31 @@ struct MenuControls: View {
             switch builtIn.state {
             case .connected:
                 Button("断开 MacBook 内建屏", action: toggleBuiltIn)
-                    .disabled(model.modeTrial != nil)
+                    .disabled(model.modeTrial != nil || external.isManaged)
             case .disconnected, .trial:
                 Button("重新连接内建屏", action: toggleBuiltIn)
             case .switching:
                 ProgressView("正在切换内建屏…").controlSize(.small)
             case .unavailable(let reason):
-                Text(reason).foregroundStyle(.secondary)
+                if !external.isManaged { Text(reason).foregroundStyle(.secondary) }
             }
             if let message = builtIn.message {
+                Text(message).foregroundStyle(.secondary)
+            }
+            switch external.state {
+            case .connected:
+                if let display = model.menuDisplay {
+                    Button("断开 \(display.name)", action: toggleExternal)
+                        .disabled(model.modeTrial != nil || builtIn.isManaged)
+                }
+            case .disconnected, .trial:
+                Button("重新连接 \(external.name)", action: toggleExternal)
+            case .switching:
+                ProgressView("正在切换 \(external.name)…").controlSize(.small)
+            case .unavailable:
+                EmptyView()
+            }
+            if let message = external.message {
                 Text(message).foregroundStyle(.secondary)
             }
         }

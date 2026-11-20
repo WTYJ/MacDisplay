@@ -14,14 +14,24 @@ struct Display: Identifiable {
         var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
         try check(CGGetActiveDisplayList(count, &ids, &count), "读取显示器")
         return ids.prefix(Int(count)).map { id in
-            let uuid = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue()
-            let identifier = uuid.flatMap { CFUUIDCreateString(nil, $0) as String? }
             return Display(
                 id: id,
-                uuid: identifier,
+                uuid: identifier(for: id),
                 name: name(for: id) ?? "显示器 \(id)",
                 isBuiltIn: CGDisplayIsBuiltin(id) != 0
             )
+        }
+    }
+
+    static func identifier(for id: CGDirectDisplayID) -> String? {
+        guard let uuid = CGDisplayCreateUUIDFromDisplayID(id)?.takeRetainedValue() else { return nil }
+        return CFUUIDCreateString(nil, uuid) as String?
+    }
+
+    static func menuExternal(in displays: [Display]) -> Display? {
+        displays.first { display in
+            guard !display.isBuiltIn, let uuid = display.uuid else { return false }
+            return displays.filter { $0.uuid == uuid }.count == 1
         }
     }
 

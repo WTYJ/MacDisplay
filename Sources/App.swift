@@ -9,6 +9,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var controlWindow: NSWindow?
     private let statusPopover = NSPopover()
     private var confirmationPanel: NSPanel?
+    private var confirmationConnection: DisplayConnection?
     private var connectionObserver: AnyCancellable?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -23,7 +24,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         statusPopover.contentViewController = NSHostingController(rootView: MenuControls(
             model: model,
             builtIn: model.builtIn,
-            toggleBuiltIn: { [weak self] in self?.toggleBuiltIn() },
+            external: model.external,
+            toggleBuiltIn: { [weak self] in self?.toggleConnection(.builtIn) },
+            toggleExternal: { [weak self] in self?.toggleConnection(.external) },
             showSettings: { [weak self] in self?.showControls() },
             quit: { NSApp.terminate(nil) }
         ))
@@ -45,8 +48,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self, selector: #selector(screensChanged),
             name: NSApplication.didChangeScreenParametersNotification, object: nil
         )
-        connectionObserver = model.builtIn.$state.removeDuplicates().sink { [weak self] state in
-            self?.updateConfirmationPanel(for: state)
+        connectionObserver = model.builtIn.$state.combineLatest(model.external.$state).sink { [weak self] builtIn, external in
+            guard let self else { return }
+            self.updateConfirmationPanel(for: self.trialConnection(builtIn: builtIn, external: external))
         }
     }
 
@@ -65,7 +69,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         if statusPopover.isShown, oldMenuDisplay != model.menuDisplay?.uuid {
             Task { await model.readMenuBrightness() }
         }
-        updateConfirmationPanel(for: model.builtIn.state)
+        updateConfirmationPanel(for: trialConnection(builtIn: model.builtIn.state, external: model.external.state))
     }
 
     @objc private func toggleMenuControls() {
@@ -82,27 +86,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
         Task { await model.readMenuBrightness() }
     }
 
-    private func toggleBuiltIn() {
+    private func toggleConnection(_ target: DisplayConnection.Target) {
         statusPopover.close()
-        model.builtIn.refresh()
-        switch model.builtIn.state {
-        case .connected where model.modeTrial == nil:
-            model.builtIn.disconnect()
+        let connection = target == .builtIn ? model.builtIn : model.external
+        switch connection.state {
+        case .connected:
+            if target == .builtIn {
+                model.disconnectBuiltIn()
+            } else {
+                model.disconnectExternal()
+            }
         case .disconnected, .trial:
-            model.builtIn.reconnect()
+            connection.reconnect()
         default:
             break
         }
     }
 
-    private func updateConfirmationPanel(for state: BuiltInDisplay.State) {
-        guard state == .trial else {
+    private func trialConnection(
+        builtIn: DisplayConnection.State, external: DisplayConnection.State
+    ) -> DisplayConnection? {
+        if builtIn == .trial { return model.builtIn }
+        if external == .trial { return model.external }
+        return nil
+    }
+
+    private func updateConfirmationPanel(for connection: DisplayConnection?) {
+        if connection !== confirmationConnection {
             confirmationPanel?.orderOut(nil)
             confirmationPanel = nil
-            return
+            confirmationConnection = nil
         }
 
-        guard confirmationPanel == nil, let screen = model.builtIn.confirmationScreen else { return }
+        guard confirmationPanel == nil, let connection, let screen = connection.confirmationScreen else { return }
         let panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 360, height: 140),
             styleMask: [.titled, .closable],
@@ -110,26 +126,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             defer: false,
             screen: screen
         )
-        panel.title = "仅使用外接显示器"
+        panel.title = connection.target == .builtIn ? "仅使用外接显示器" : "断开 \(connection.name)"
         panel.level = .modalPanel
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         panel.delegate = self
-        panel.contentViewController = NSHostingController(rootView: BuiltInDisplayConfirmation(display: model.builtIn))
+        panel.contentViewController = NSHostingController(rootView: DisplayConnectionConfirmation(connection: connection))
         let visibleFrame = screen.visibleFrame
         panel.setFrameOrigin(NSPoint(
             x: visibleFrame.midX - panel.frame.width / 2,
             y: visibleFrame.midY - panel.frame.height / 2
         ))
         confirmationPanel = panel
+        confirmationConnection = connection
         NSApp.activate()
         panel.makeKeyAndOrderFront(nil)
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         guard sender === confirmationPanel else { return true }
-        model.builtIn.reconnect()
+        confirmationConnection?.reconnect()
         return false
     }
 
@@ -144,7 +161,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 defer: false
             )
             window.title = "MacDisplay"
-            window.contentViewController = NSHostingController(rootView: Controls(model: model))
+            window.contentViewController = NSHostingController(rootView: Controls(model: model, external: model.external))
             window.isReleasedWhenClosed = false
             window.center()
             controlWindow = window
@@ -154,24 +171,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 }
 
-private struct BuiltInDisplayConfirmation: View {
-    let display: BuiltInDisplay
+private struct DisplayConnectionConfirmation: View {
+    let connection: DisplayConnection
 
     var body: some View {
+        let disconnectingBuiltIn = connection.target == .builtIn
         VStack(alignment: .leading, spacing: 16) {
-            Text("外接显示器显示正常吗？")
+            Text(disconnectingBuiltIn ? "外接显示器显示正常吗？" : "MacBook 内建屏显示正常吗？")
                 .font(.headline)
             TimelineView(.periodic(from: .now, by: 0.25)) { context in
-                let remaining = display.confirmationSecondsRemaining(at: context.date)
-                Text("未确认将在 \(remaining) 秒后重新连接内建屏。")
+                let remaining = connection.confirmationSecondsRemaining(at: context.date)
+                Text("未确认将在 \(remaining) 秒后重新连接\(connection.name)。")
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
             HStack {
                 Spacer()
-                Button("恢复内建屏") { display.reconnect() }
+                Button("恢复\(connection.name)") { connection.reconnect() }
                     .keyboardShortcut(.cancelAction)
-                Button("保留仅外屏") { display.keepDisconnected() }
+                Button(disconnectingBuiltIn ? "保留仅外屏" : "保持断开") { connection.keepDisconnected() }
                     .buttonStyle(.borderedProminent)
             }
         }
@@ -202,7 +220,7 @@ struct MacDisplay {
 
     @MainActor private static func runCommand(_ arguments: [String]) throws {
         if arguments == ["--built-in-status"] {
-            let display = BuiltInDisplay()
+            let display = DisplayConnection(target: .builtIn)
             display.refresh()
             display.diagnostics.forEach { print($0) }
             return

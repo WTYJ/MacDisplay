@@ -3,7 +3,8 @@ import SwiftUI
 
 @MainActor
 final class Model: ObservableObject {
-    let builtIn = BuiltInDisplay()
+    let builtIn = DisplayConnection(target: .builtIn)
+    let external = DisplayConnection(target: .external)
 
     @Published private(set) var displays: [Display] = []
     @Published var displayError: String?
@@ -16,6 +17,7 @@ final class Model: ObservableObject {
     @Published var modeMessage: String?
     @Published var syncDimming = false
     @Published private(set) var hardwareBusy = false
+    @Published private(set) var isExportingEDID = false
     @Published private(set) var diagnosticMessage: String?
 
     @Published private var readings: [String: [DDC.Control: DDC.Value]] = [:]
@@ -43,10 +45,7 @@ final class Model: ObservableObject {
     var canReadHardware: Bool { DDC.helper != nil && hardwareUUID != nil }
 
     var menuDisplay: Display? {
-        displays.first { display in
-            guard !display.isBuiltIn, let uuid = display.uuid else { return false }
-            return displays.filter { $0.uuid == uuid }.count == 1
-        }
+        Display.menuExternal(in: displays)
     }
 
     var canDimSelectedDisplay: Bool {
@@ -95,7 +94,19 @@ final class Model: ObservableObject {
         readings = readings.filter { connected.contains($0.key) }
         hardwareMessages = hardwareMessages.filter { connected.contains($0.key) }
         dimming.refresh(displays)
-        builtIn.refresh()
+        let snapshot = displayError == nil ? displays : nil
+        builtIn.refresh(displays: snapshot)
+        external.refresh(displays: snapshot)
+    }
+
+    func disconnectBuiltIn() {
+        guard modeTrial == nil, !external.isManaged else { return }
+        builtIn.disconnect()
+    }
+
+    func disconnectExternal() {
+        guard modeTrial == nil, !builtIn.isManaged, let uuid = menuDisplay?.uuid else { return }
+        external.disconnect(expectedExternalUUID: uuid)
     }
 
     func setDimmingAmount(_ amount: Int) {
@@ -106,7 +117,7 @@ final class Model: ObservableObject {
     }
 
     func tryMode(_ mode: DisplayMode) {
-        guard modeTrial == nil, !builtIn.isTransitioning,
+        guard modeTrial == nil, !builtIn.isTransitioning, !external.isTransitioning,
               let display = selectedDisplay, let uuid = display.uuid,
               let original = display.currentMode, DisplayMode(original) != mode,
               let candidate = display.modes.first(where: { DisplayMode($0) == mode }) else { return }
@@ -197,23 +208,30 @@ final class Model: ObservableObject {
     }
 
     func exportEDID() async {
-        guard !hardwareBusy, let uuid = hardwareUUID, let name = selectedDisplay?.name else { return }
-        hardwareBusy = true
-        defer { hardwareBusy = false }
+        guard !isExportingEDID, !hardwareBusy, let uuid = hardwareUUID,
+              let name = selectedDisplay?.name else { return }
+        isExportingEDID = true
+        defer { isExportingEDID = false }
         diagnosticMessage = nil
         do {
-            let data = try await DDC.edid(uuid: uuid)
+            let data = try await readEDID(for: uuid)
             guard uuid == hardwareUUID else { return }
             let panel = NSSavePanel()
             panel.title = "导出 EDID"
             panel.nameFieldStringValue = name.replacingOccurrences(of: "/", with: "-") + "-EDID.bin"
             if await panel.begin() == .OK, let url = panel.url {
                 try data.write(to: url, options: .atomic)
-                diagnosticMessage = "已导出 \(data.count) 字节的 EDID。"
+                if uuid == hardwareUUID { diagnosticMessage = "已导出 \(data.count) 字节的 EDID。" }
             }
         } catch {
             if uuid == hardwareUUID { diagnosticMessage = error.localizedDescription }
         }
+    }
+
+    private func readEDID(for uuid: String) async throws -> Data {
+        hardwareBusy = true
+        defer { hardwareBusy = false }
+        return try await DDC.edid(uuid: uuid)
     }
 
     func writeHardware(_ control: DDC.Control, value: Int, for uuid: String) async {
@@ -227,12 +245,9 @@ final class Model: ObservableObject {
         do {
             let actual = try await DDC.write(uuid: uuid, control: control, value: value)
             guard isConnected(uuid) else { return }
-            guard (0...current.maximum).contains(actual) else {
-                throw DisplayFailure("显示器返回了超出原范围的值，请重新读取。")
-            }
-            readings[uuid]?[control]?.current = actual
-            if actual != value {
-                hardwareMessages[uuid] = "显示器返回 \(actual)，请求值为 \(value)。"
+            readings[uuid]?[control] = actual
+            if actual.current != value {
+                hardwareMessages[uuid] = "显示器返回 \(actual.current)，请求值为 \(value)。"
             }
         } catch {
             guard isConnected(uuid) else { return }
@@ -242,6 +257,7 @@ final class Model: ObservableObject {
     }
 
     func shutDown() {
+        external.restoreOnQuit()
         builtIn.restoreOnQuit()
         revertMode()
     }

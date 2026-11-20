@@ -36,18 +36,32 @@ private final class DisplayConnectionAPI {
         #endif
     }
 
-    func builtInID() -> CGDirectDisplayID? {
+    private func displayIDs() -> [CGDirectDisplayID] {
         var ids = [CGDirectDisplayID](repeating: 0, count: 32)
         var count: UInt32 = 0
-        guard enumerate(UInt32(ids.count), &ids, &count) == 0 else { return nil }
-        let builtIn = ids.prefix(Int(count)).filter { $0 != 0 && CGDisplayIsBuiltin($0) != 0 }
+        guard enumerate(UInt32(ids.count), &ids, &count) == 0 else { return [] }
+        return ids.prefix(Int(count)).filter { $0 != 0 }
+    }
+
+    func builtInID() -> CGDirectDisplayID? {
+        let builtIn = displayIDs().filter { CGDisplayIsBuiltin($0) != 0 }
         return builtIn.count == 1 ? builtIn[0] : nil
     }
 
+    func externalID(uuid: String) -> CGDirectDisplayID? {
+        let matches = displayIDs().filter { Display.identifier(for: $0) == uuid }
+        guard matches.count == 1, let id = matches.first, CGDisplayIsBuiltin(id) == 0 else { return nil }
+        return id
+    }
+
     func isUsableExternal(_ display: Display) -> Bool {
-        guard !display.isBuiltIn, CGDisplayIsAsleep(display.id) == 0,
-              CGDisplayIsInMirrorSet(display.id) == 0,
-              let info = displayInfo(display.id)?.takeRetainedValue() as? [String: Any],
+        CGDisplayIsAsleep(display.id) == 0 && CGDisplayIsInMirrorSet(display.id) == 0
+            && isPhysicalExternal(display.id)
+    }
+
+    private func isPhysicalExternal(_ id: CGDirectDisplayID) -> Bool {
+        guard id != 0, CGDisplayIsBuiltin(id) == 0,
+              let info = displayInfo(id)?.takeRetainedValue() as? [String: Any],
               let location = info["IODisplayLocation"] as? String else { return false }
         let service = IORegistryEntryCopyFromPath(kIOMainPortDefault, location as CFString)
         guard service != IO_OBJECT_NULL else { return false }
@@ -55,9 +69,15 @@ private final class DisplayConnectionAPI {
         return true
     }
 
-    func setEnabled(_ enabled: Bool, id: CGDirectDisplayID) throws {
-        guard id != 0, CGDisplayIsBuiltin(id) != 0 else {
-            throw DisplayFailure("系统没有确认目标是内建屏。")
+    func setEnabled(_ enabled: Bool, id: CGDirectDisplayID, externalUUID: String? = nil) throws {
+        if let externalUUID {
+            guard externalID(uuid: externalUUID) == id, enabled || isPhysicalExternal(id) else {
+                throw DisplayFailure("系统无法确认目标外接显示器。")
+            }
+        } else {
+            guard id != 0, CGDisplayIsBuiltin(id) != 0 else {
+                throw DisplayFailure("系统没有确认目标是内建屏。")
+            }
         }
         var configuration: CGDisplayConfigRef?
         let start = CGBeginDisplayConfiguration(&configuration)
@@ -77,8 +97,10 @@ private final class DisplayConnectionAPI {
 }
 
 @MainActor
-final class BuiltInDisplay: ObservableObject {
-    static let confirmationDuration: TimeInterval = 10
+final class DisplayConnection: ObservableObject {
+    static let confirmationDuration: TimeInterval = 15
+    private static let recoveryDuration: TimeInterval = 10
+    private static let retryInterval: TimeInterval = 1.5
 
     enum State: Equatable {
         case unavailable(String)
@@ -88,12 +110,17 @@ final class BuiltInDisplay: ObservableObject {
         case trial
     }
 
+    enum Target {
+        case builtIn
+        case external
+    }
+
     private enum Phase {
         case disconnecting(Date)
         case trial(Date)
         case disconnected
         case waitingForLid
-        case reconnecting(Date)
+        case reconnecting(deadline: Date, nextAttempt: Date)
         case recoveryFailed
     }
 
@@ -101,8 +128,12 @@ final class BuiltInDisplay: ObservableObject {
     @Published private(set) var message: String?
 
     var isTransitioning: Bool { state == .switching || state == .trial }
+    var isManaged: Bool { phase != nil }
+    var name: String { target == .builtIn ? "内建屏" : managedExternal?.name ?? "外屏" }
 
-    private let api = DisplayConnectionAPI()
+    let target: Target
+    private static let api = DisplayConnectionAPI()
+    private var api: DisplayConnectionAPI? { Self.api }
     private let isBaseM3: Bool = {
         var size = 0
         guard sysctlbyname("machdep.cpu.brand_string", nil, &size, nil, 0) == 0,
@@ -113,8 +144,13 @@ final class BuiltInDisplay: ObservableObject {
     }()
 
     private var managedID: CGDirectDisplayID?
+    private var managedExternal: Display?
     private var phase: Phase?
     private var monitor: Task<Void, Never>?
+
+    init(target: Target) {
+        self.target = target
+    }
 
     private var lidClosed: Bool? {
         let root = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("IOPMrootDomain"))
@@ -124,21 +160,37 @@ final class BuiltInDisplay: ObservableObject {
             .takeRetainedValue() as? Bool
     }
 
-    private var activeBuiltIn: Display? {
-        try? Display.active().first { $0.isBuiltIn }
+    private func activeTarget(in displays: [Display]) -> Display? {
+        switch target {
+        case .builtIn:
+            return displays.first(where: \.isBuiltIn)
+        case .external:
+            guard let uuid = managedExternal?.uuid else { return Display.menuExternal(in: displays) }
+            return displays.first { !$0.isBuiltIn && $0.uuid == uuid }
+        }
     }
 
-    private var hasUsableExternal: Bool {
-        !usableExternals.isEmpty
+    private func usableBuiltIn(in displays: [Display]) -> NSScreen? {
+        guard let display = displays.first(where: \.isBuiltIn),
+              CGDisplayIsAsleep(display.id) == 0, CGDisplayIsInMirrorSet(display.id) == 0 else { return nil }
+        return Display.screen(for: display.id)
     }
 
-    private var usableExternals: [Display] {
-        guard let api, let displays = try? Display.active() else { return [] }
-        return displays.filter { api.isUsableExternal($0) }
+    private func hasSurvivor(in displays: [Display], api: DisplayConnectionAPI) -> Bool {
+        switch target {
+        case .builtIn: displays.contains(where: api.isUsableExternal)
+        case .external: usableBuiltIn(in: displays) != nil
+        }
     }
 
     var confirmationScreen: NSScreen? {
-        usableExternals.lazy.compactMap { Display.screen(for: $0.id) }.first
+        guard let api, let displays = try? Display.active() else { return nil }
+        switch target {
+        case .builtIn:
+            return displays.lazy.filter(api.isUsableExternal).compactMap { Display.screen(for: $0.id) }.first
+        case .external:
+            return usableBuiltIn(in: displays)
+        }
     }
 
     func confirmationSecondsRemaining(at date: Date) -> Int {
@@ -151,86 +203,129 @@ final class BuiltInDisplay: ObservableObject {
     }
 
     var diagnostics: [String] {
-        [
+        let displays = try? Display.active()
+        return [
             "connection-api: \(api == nil ? "unavailable" : "available")",
             "lid: \(lidClosed.map { $0 ? "closed" : "open" } ?? "unknown")",
             "built-in-enumerated: \(api?.builtInID().map(String.init) ?? "none")",
-            "built-in-active: \(activeBuiltIn?.id.description ?? "none")",
-            "usable-external: \(hasUsableExternal)",
+            "built-in-active: \(displays?.first(where: \.isBuiltIn)?.id.description ?? "none")",
+            "usable-external: \(displays?.contains(where: { api?.isUsableExternal($0) == true }) == true)",
             "state: \(state)"
         ]
     }
 
     func refresh() {
-        guard let api, let closed = lidClosed else {
+        refresh(displays: try? Display.active())
+    }
+
+    func refresh(displays: [Display]?) {
+        guard let api else {
             updateState(.unavailable("需要支持显示器软断开的 Apple Silicon MacBook。"))
             return
         }
-        if closed {
-            if managedID != nil {
+        let closed = lidClosed
+        if target == .builtIn, closed != false {
+            if phase != nil {
                 phase = .waitingForLid
                 updateState(.unavailable("已合盖，重新开盖后将尝试恢复内建屏。"))
-            } else {
+                startMonitoring()
+            } else if closed == true {
                 updateState(.unavailable("MacBook 已合盖。"))
+            } else {
+                updateState(.unavailable("无法读取 MacBook 上盖状态。"))
             }
             return
         }
 
-        let active = activeBuiltIn
+        let active = displays.flatMap { activeTarget(in: $0) }
+        let hasSurvivor = displays.map { hasSurvivor(in: $0, api: api) }
         let now = Date()
+        if target == .external, closed != false {
+            switch phase {
+            case .disconnecting, .trial, .disconnected:
+                beginRecovery(api, now: now)
+                return
+            default:
+                break
+            }
+        }
         switch phase {
         case .disconnecting(let deadline):
-            if active == nil {
-                if !hasUsableExternal {
-                    reconnect()
-                    return
+            if active == nil, let hasSurvivor {
+                if hasSurvivor {
+                    phase = .trial(now.addingTimeInterval(Self.confirmationDuration))
+                    updateState(.trial)
+                } else {
+                    beginRecovery(api, now: now)
                 }
-                phase = .trial(now.addingTimeInterval(Self.confirmationDuration))
-                updateState(.trial)
                 return
             }
             if now < deadline { return }
-            finish()
-            message = "系统仍将内建屏列为活动显示器。"
-        case .trial(let deadline):
-            if active == nil {
-                if now >= deadline || !hasUsableExternal { reconnect() }
+            if displays == nil {
+                beginRecovery(api, now: now)
                 return
             }
+            let notice = "系统仍将\(name)列为活动显示器。"
             finish()
-            message = "内建屏已恢复。"
-        case .disconnected:
+            message = notice
+        case .trial, .disconnected:
             if active == nil {
-                if !hasUsableExternal { reconnect() }
-                else { updateState(.disconnected) }
+                let timedOut: Bool
+                if case .trial(let deadline) = phase {
+                    timedOut = now >= deadline
+                } else {
+                    timedOut = false
+                }
+                if timedOut || hasSurvivor == false {
+                    beginRecovery(api, now: now)
+                } else if case .trial = phase {
+                    updateState(.trial)
+                } else {
+                    updateState(.disconnected)
+                }
                 return
             }
-            finish()
-            message = "内建屏已恢复。"
+            finishRecovery()
         case .waitingForLid:
             if active == nil {
-                reconnect()
+                beginRecovery(api, now: now)
                 return
             }
-            finish()
-            message = "开盖后内建屏已恢复。"
-        case .reconnecting(let deadline):
+            finishRecovery("开盖后内建屏已恢复。")
+        case .reconnecting(let deadline, let nextAttempt):
             if active == nil {
-                if now < deadline { return }
+                if now < deadline {
+                    if now >= nextAttempt { attemptRecovery(api, now: now, deadline: deadline) }
+                    return
+                }
                 phase = .recoveryFailed
                 stopMonitoring()
-                message = "macOS 尚未恢复内建屏。可重试，或保持外屏连接并合盖后再开盖。"
+                message = target == .builtIn
+                    ? "macOS 尚未恢复内建屏。可重试，或保持外屏连接并合盖后再开盖。"
+                    : "macOS 尚未恢复\(name)。可重试，或重新插拔显示器连接线。"
             } else {
-                finish()
-                message = "内建屏已恢复。"
+                finishRecovery()
             }
         case .recoveryFailed:
-            if active != nil {
-                finish()
-                message = "内建屏已恢复。"
-            }
+            if active != nil { finishRecovery() }
         case nil:
             break
+        }
+
+        if target == .external {
+            if managedExternal != nil {
+                updateState(.disconnected)
+            } else if closed != false {
+                updateState(.unavailable("请打开 MacBook 上盖。"))
+            } else if hasSurvivor != true {
+                updateState(.unavailable("请先让 MacBook 内建屏显示扩展桌面。"))
+            } else if let active, api.isUsableExternal(active),
+                      let uuid = active.uuid, api.externalID(uuid: uuid) == active.id {
+                updateState(.connected)
+            } else {
+                updateState(.unavailable("需要可软断开的实体外屏。"))
+            }
+            return
         }
 
         if let active {
@@ -238,7 +333,7 @@ final class BuiltInDisplay: ObservableObject {
                 updateState(.unavailable("基础款 Apple M3 的内建屏可能需要重启才能恢复。"))
             } else if CGDisplayIsInMirrorSet(active.id) != 0 {
                 updateState(.unavailable("请先退出内建屏镜像。"))
-            } else if !hasUsableExternal {
+            } else if hasSurvivor != true {
                 updateState(.unavailable("请先连接一台正在显示扩展桌面的实体外屏。"))
             } else {
                 updateState(.connected)
@@ -250,13 +345,22 @@ final class BuiltInDisplay: ObservableObject {
         }
     }
 
-    func disconnect() {
-        refresh()
-        guard state == .connected, let api, let display = activeBuiltIn else { return }
+    func disconnect(expectedExternalUUID: String? = nil) {
+        let displays = try? Display.active()
+        refresh(displays: displays)
+        guard state == .connected, let api, let displays, let display = activeTarget(in: displays) else { return }
+        let uuid = target == .external ? display.uuid : nil
+        if target == .external {
+            guard let uuid, uuid == expectedExternalUUID else { return }
+        }
         message = nil
         do {
-            try api.setEnabled(false, id: display.id)
-            managedID = display.id
+            try api.setEnabled(false, id: display.id, externalUUID: uuid)
+            if target == .external {
+                managedExternal = display
+            } else {
+                managedID = display.id
+            }
             phase = .disconnecting(Date().addingTimeInterval(4))
             updateState(.switching)
             startMonitoring()
@@ -267,8 +371,9 @@ final class BuiltInDisplay: ObservableObject {
     }
 
     func keepDisconnected() {
-        guard case .trial(let deadline) = phase, Date() < deadline, hasUsableExternal,
-              lidClosed == false, activeBuiltIn == nil else {
+        guard case .trial(let deadline) = phase, Date() < deadline, lidClosed == false,
+              let api, let displays = try? Display.active(),
+              activeTarget(in: displays) == nil, hasSurvivor(in: displays, api: api) else {
             refresh()
             return
         }
@@ -277,37 +382,46 @@ final class BuiltInDisplay: ObservableObject {
     }
 
     func reconnect() {
-        guard let api, lidClosed == false else { return }
-        if activeBuiltIn != nil {
-            finish()
+        guard let api else { return }
+        if target == .builtIn {
+            guard lidClosed == false else { return }
+        } else {
+            guard managedExternal != nil else { return }
+        }
+        if let displays = try? Display.active(), activeTarget(in: displays) != nil {
+            finishRecovery()
             refresh()
+            return
+        }
+        beginRecovery(api, now: Date())
+        refresh()
+    }
+
+    private func beginRecovery(_ api: DisplayConnectionAPI, now: Date) {
+        message = nil
+        startMonitoring()
+        attemptRecovery(api, now: now, deadline: now.addingTimeInterval(Self.recoveryDuration))
+    }
+
+    private func attemptRecovery(_ api: DisplayConnectionAPI, now: Date, deadline: Date) {
+        phase = .reconnecting(deadline: deadline, nextAttempt: now.addingTimeInterval(Self.retryInterval))
+        updateState(.switching)
+        if target == .external {
+            guard let uuid = managedExternal?.uuid, let id = api.externalID(uuid: uuid) else { return }
+            // The monitor retries until the recovery deadline.
+            try? api.setEnabled(true, id: id, externalUUID: uuid)
             return
         }
         let original = managedID.flatMap { CGDisplayIsBuiltin($0) != 0 ? $0 : nil }
-        guard let id = api.builtInID() ?? original else {
-            phase = .recoveryFailed
-            stopMonitoring()
-            updateState(.disconnected)
-            message = "系统没有找到内建屏。请保持外屏连接并合盖后再开盖。"
-            return
-        }
+        guard let id = api.builtInID() ?? original else { return }
         do {
             try api.setEnabled(true, id: id)
             managedID = id
-            phase = .reconnecting(Date().addingTimeInterval(5))
-            updateState(.switching)
-            startMonitoring()
-            refresh()
-        } catch {
-            phase = .recoveryFailed
-            stopMonitoring()
-            updateState(.disconnected)
-            message = error.localizedDescription
-        }
+        } catch { /* The monitor retries until the recovery deadline. */ }
     }
 
     func restoreOnQuit() {
-        guard managedID != nil else { return }
+        guard managedID != nil || managedExternal != nil else { return }
         reconnect()
         stopMonitoring()
     }
@@ -325,8 +439,15 @@ final class BuiltInDisplay: ObservableObject {
 
     private func finish() {
         managedID = nil
+        managedExternal = nil
         phase = nil
         stopMonitoring()
+    }
+
+    private func finishRecovery(_ notice: String? = nil) {
+        let restored = notice ?? "\(name)已恢复。"
+        finish()
+        message = restored
     }
 
     private func stopMonitoring() {
