@@ -1,3 +1,5 @@
+import AppKit
+import ServiceManagement
 import SwiftUI
 
 // Use SwiftUI's property wrapper with the standalone Command Line Tools build.
@@ -10,7 +12,7 @@ struct Controls: View {
         TabView {
             displayControls.tabItem { Label("显示", systemImage: "display") }
             diagnosticControls.tabItem { Label("诊断", systemImage: "stethoscope") }
-            AboutControls().tabItem { Label("关于", systemImage: "info.circle") }
+            ApplicationControls().tabItem { Label("应用", systemImage: "gearshape") }
         }
         .padding(20)
         .frame(minWidth: 520, idealWidth: 560, minHeight: 335, idealHeight: 440)
@@ -179,6 +181,58 @@ struct Controls: View {
     }
 }
 
+private struct LoginLaunchControls: View {
+    @ViewState private var status = SMAppService.Status.notRegistered
+    @ViewState private var errorMessage: String?
+
+    var body: some View {
+        Section("启动") {
+            Toggle("登录时启动 MacDisplay", isOn: Binding(
+                get: { isRegistered(status) },
+                set: setEnabled
+            ))
+            .toggleStyle(.switch)
+            .onAppear(perform: refreshStatus)
+            .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+                refreshStatus()
+            }
+
+            if status == .requiresApproval {
+                Text("需要在 macOS 的登录项设置中允许 MacDisplay。")
+                    .foregroundStyle(.secondary)
+                Button("打开登录项设置…") { SMAppService.openSystemSettingsLoginItems() }
+            }
+            if let errorMessage {
+                Text(errorMessage).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private func isRegistered(_ status: SMAppService.Status) -> Bool {
+        status == .enabled || status == .requiresApproval
+    }
+
+    private func refreshStatus() {
+        status = SMAppService.mainApp.status
+    }
+
+    private func setEnabled(_ enabled: Bool) {
+        let service = SMAppService.mainApp
+        errorMessage = nil
+        defer { refreshStatus() }
+        guard enabled != isRegistered(service.status) else { return }
+        do {
+            if enabled {
+                try service.register()
+            } else {
+                try service.unregister()
+            }
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
 private struct BuiltInDisplayControls: View {
     @ObservedObject var display: BuiltInDisplay
     let modeTrialActive: Bool
@@ -239,7 +293,7 @@ private struct SettingsDisclosure<Content: View>: View {
     }
 }
 
-private struct AboutControls: View {
+private struct ApplicationControls: View {
     private enum UpdateStatus: Equatable {
         case idle
         case checking
@@ -263,17 +317,19 @@ private struct AboutControls: View {
                         .accessibilityHidden(true)
                     VStack(alignment: .leading, spacing: 4) {
                         Text("MacDisplay").font(.title2.weight(.semibold))
-                        Text("版本 \(version)")
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
+                        HStack {
+                            Text("版本 \(version)")
+                                .foregroundStyle(.secondary)
+                                .textSelection(.enabled)
+                            Spacer(minLength: 16)
+                            Button("检查更新") { Task { await checkForUpdates() } }
+                                .controlSize(.small)
+                                .disabled(updateStatus == .checking)
+                        }
                     }
                 }
                 .padding(.vertical, 4)
-            }
 
-            Section {
-                Button("检查更新") { Task { await checkForUpdates() } }
-                    .disabled(updateStatus == .checking)
                 switch updateStatus {
                 case .idle:
                     EmptyView()
@@ -291,6 +347,8 @@ private struct AboutControls: View {
                     Text("无法检查更新，请稍后重试。").foregroundStyle(.secondary)
                 }
             }
+
+            LoginLaunchControls()
 
             if let license, let source = URL(string: "https://github.com/waydabber/m1ddc") {
                 Section("开源组件") {
