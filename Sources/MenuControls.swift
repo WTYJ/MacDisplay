@@ -5,8 +5,7 @@ struct MenuControls: View {
     @ObservedObject var model: Model
     @ObservedObject var builtIn: DisplayConnection
     @ObservedObject var external: DisplayConnection
-    let toggleBuiltIn: () -> Void
-    let toggleExternal: () -> Void
+    let toggleConnection: (DisplayConnection.Target) -> Void
     let showSettings: () -> Void
     let quit: () -> Void
 
@@ -16,7 +15,11 @@ struct MenuControls: View {
                 brightness
                 Divider()
             }
-            connection
+            VStack(alignment: .leading, spacing: 6) {
+                DisplayConnectionControls(
+                    model: model, builtIn: builtIn, external: external, toggleConnection: toggleConnection
+                )
+            }
             Divider()
             HStack {
                 Button("显示设置…", action: showSettings)
@@ -56,15 +59,22 @@ struct MenuControls: View {
             }
         }
     }
+}
 
-    private var connection: some View {
-        VStack(alignment: .leading, spacing: 6) {
+struct DisplayConnectionControls: View {
+    @ObservedObject var model: Model
+    @ObservedObject var builtIn: DisplayConnection
+    @ObservedObject var external: DisplayConnection
+    let toggleConnection: (DisplayConnection.Target) -> Void
+
+    var body: some View {
+        Group {
             switch builtIn.state {
             case .connected:
-                Button("断开 MacBook 内建屏", action: toggleBuiltIn)
+                Button("断开 MacBook 内建屏") { toggleConnection(.builtIn) }
                     .disabled(model.modeTrial != nil || external.isManaged)
             case .disconnected, .trial:
-                Button("重新连接内建屏", action: toggleBuiltIn)
+                Button("重新连接内建屏") { toggleConnection(.builtIn) }
             case .switching:
                 ProgressView("正在切换内建屏…").controlSize(.small)
             case .unavailable(let reason):
@@ -76,11 +86,11 @@ struct MenuControls: View {
             switch external.state {
             case .connected:
                 if let display = model.menuDisplay {
-                    Button("断开 \(display.name)", action: toggleExternal)
+                    Button("断开 \(display.name)") { toggleConnection(.external) }
                         .disabled(model.modeTrial != nil || builtIn.isManaged)
                 }
             case .disconnected, .trial:
-                Button("重新连接 \(external.name)", action: toggleExternal)
+                Button("重新连接 \(external.name)") { toggleConnection(.external) }
             case .switching:
                 ProgressView("正在切换 \(external.name)…").controlSize(.small)
             case .unavailable:

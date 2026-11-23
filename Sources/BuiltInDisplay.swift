@@ -14,6 +14,11 @@ private final class DisplayConnectionAPI {
     private let enumerate: Enumerate
     private let displayInfo: DisplayInfo
 
+    struct ExternalHardware: Codable {
+        let location: String
+        let edidUUID: String?
+    }
+
     init?() {
         #if arch(arm64)
         // System frameworks stay loaded for the lifetime of the app.
@@ -54,6 +59,24 @@ private final class DisplayConnectionAPI {
         return id
     }
 
+    func externalRecoveryID(uuid: String, hardware: ExternalHardware) -> CGDirectDisplayID? {
+        guard let ids = displayIDs() else { return nil }
+        let identified = ids.map { (id: $0, uuid: Display.identifier(for: $0)) }
+        let matches = identified.filter { $0.uuid == uuid }
+        if !matches.isEmpty {
+            guard matches.count == 1, let match = matches.first, CGDisplayIsBuiltin(match.id) == 0 else { return nil }
+            return match.id
+        }
+
+        // WindowServer can keep the disabled slot and location but omit its display UUID.
+        guard hardware.edidUUID != nil, isExternalAttached(hardware) else { return nil }
+        let slots = identified.filter {
+            $0.uuid == nil && CGDisplayIsBuiltin($0.id) == 0 && CGDisplayIsActive($0.id) == 0
+                && displayLocation($0.id) == hardware.location
+        }
+        return slots.count == 1 ? slots.first?.id : nil
+    }
+
     func isExternalMissing(uuid: String, originalID: CGDirectDisplayID) -> Bool {
         guard let ids = displayIDs() else { return false }
         return ids.allSatisfy { id in
@@ -64,27 +87,62 @@ private final class DisplayConnectionAPI {
 
     func isUsableExternal(_ display: Display) -> Bool {
         CGDisplayIsAsleep(display.id) == 0 && CGDisplayIsInMirrorSet(display.id) == 0
-            && physicalExternalLocation(display.id) != nil
+            && externalHardware(display.id) != nil
     }
 
-    func physicalExternalLocation(_ id: CGDirectDisplayID) -> String? {
+    func externalHardware(_ id: CGDirectDisplayID) -> ExternalHardware? {
         guard id != 0, CGDisplayIsBuiltin(id) == 0,
-              let info = displayInfo(id)?.takeRetainedValue() as? [String: Any],
-              let location = info["IODisplayLocation"] as? String,
-              isExternalAttached(at: location) else { return nil }
-        return location
+              let location = displayLocation(id) else { return nil }
+        let service = IORegistryEntryCopyFromPath(kIOMainPortDefault, location as CFString)
+        guard service != IO_OBJECT_NULL else { return nil }
+        defer { IOObjectRelease(service) }
+        return ExternalHardware(location: location, edidUUID: edidUUID(of: service))
     }
 
-    func isExternalAttached(at location: String) -> Bool {
-        let service = IORegistryEntryCopyFromPath(kIOMainPortDefault, location as CFString)
+    private func displayLocation(_ id: CGDirectDisplayID) -> String? {
+        let info = displayInfo(id)?.takeRetainedValue() as? [String: Any]
+        return info?["IODisplayLocation"] as? String
+    }
+
+    func isExternalAttached(_ hardware: ExternalHardware) -> Bool {
+        let service = IORegistryEntryCopyFromPath(kIOMainPortDefault, hardware.location as CFString)
         guard service != IO_OBJECT_NULL else { return false }
-        IOObjectRelease(service)
-        return true
+        defer { IOObjectRelease(service) }
+        guard let uuid = hardware.edidUUID else { return true }
+        return edidUUID(of: service) == uuid
+    }
+
+    func externalLinkID(_ hardware: ExternalHardware) -> UInt64? {
+        guard hardware.location.hasSuffix("/IOMobileFramebufferShim"),
+              let controller = hardware.location.split(separator: "/").dropLast().last?
+                .split(separator: "@", maxSplits: 1).first,
+              controller.hasPrefix("dispext") else { return nil }
+        // The framebuffer and the DP proxy live under separate driver branches for the same controller.
+        let endpoint = "/\(controller):dcpdp-device-epic:"
+        var iterator: io_iterator_t = IO_OBJECT_NULL
+        guard IOServiceGetMatchingServices(kIOMainPortDefault, IOServiceMatching("DCPDPDeviceProxy"), &iterator)
+            == KERN_SUCCESS, iterator != IO_OBJECT_NULL else { return nil }
+        defer { IOObjectRelease(iterator) }
+        var match: UInt64?
+        while case let service = IOIteratorNext(iterator), service != IO_OBJECT_NULL {
+            defer { IOObjectRelease(service) }
+            guard let path = IORegistryEntryCopyPath(service, kIOServicePlane)?.takeRetainedValue() as String?,
+                  path.contains(endpoint) else { continue }
+            var id: UInt64 = 0
+            guard match == nil, IORegistryEntryGetRegistryEntryID(service, &id) == KERN_SUCCESS else { return nil }
+            match = id
+        }
+        return match
+    }
+
+    private func edidUUID(of service: io_registry_entry_t) -> String? {
+        IORegistryEntryCreateCFProperty(service, "EDID UUID" as CFString, kCFAllocatorDefault, 0)?
+            .takeRetainedValue() as? String
     }
 
     func setEnabled(_ enabled: Bool, id: CGDirectDisplayID, externalUUID: String? = nil) throws {
         if let externalUUID {
-            guard externalID(uuid: externalUUID) == id, enabled || physicalExternalLocation(id) != nil else {
+            guard externalID(uuid: externalUUID) == id, enabled || externalHardware(id) != nil else {
                 throw DisplayFailure("系统无法确认目标外接显示器。")
             }
         } else {
@@ -92,6 +150,15 @@ private final class DisplayConnectionAPI {
                 throw DisplayFailure("系统没有确认目标是内建屏。")
             }
         }
+        try applyEnabled(enabled, id: id)
+    }
+
+    func restoreExternal(uuid: String, hardware: ExternalHardware) throws {
+        guard let id = externalRecoveryID(uuid: uuid, hardware: hardware) else { return }
+        try applyEnabled(true, id: id)
+    }
+
+    private func applyEnabled(_ enabled: Bool, id: CGDirectDisplayID) throws {
         var configuration: CGDisplayConfigRef?
         let start = CGBeginDisplayConfiguration(&configuration)
         guard start == .success, let configuration else {
@@ -137,12 +204,11 @@ final class DisplayConnection: ObservableObject {
         case recoveryFailed
     }
 
-    private struct ManagedExternal {
+    private struct ManagedExternal: Codable {
         let id: CGDirectDisplayID
         let uuid: String
         let name: String
-        let location: String
-        var wasAttachedWhileInactive = false
+        let hardware: DisplayConnectionAPI.ExternalHardware
     }
 
     @Published private(set) var state: State = .unavailable("正在检查显示器。")
@@ -166,11 +232,21 @@ final class DisplayConnection: ObservableObject {
 
     private var managedID: CGDirectDisplayID?
     private var managedExternal: ManagedExternal?
+    private var wasAttachedWhileInactive = false
+    private var externalLinkID: UInt64?
     private var phase: Phase?
     private var monitor: Task<Void, Never>?
+    private let defaults: UserDefaults
+    private static let recoveryKey = "PendingExternalDisplayRecovery"
+    private var pendingExternals: [ManagedExternal] = []
 
-    init(target: Target) {
+    init(target: Target, defaults: UserDefaults = .standard) {
         self.target = target
+        self.defaults = defaults
+        if target == .external, let data = defaults.data(forKey: Self.recoveryKey),
+           let records = try? PropertyListDecoder().decode([ManagedExternal].self, from: data) {
+            pendingExternals = records
+        }
     }
 
     private var lidClosed: Bool? {
@@ -186,9 +262,16 @@ final class DisplayConnection: ObservableObject {
         case .builtIn:
             return displays.first(where: \.isBuiltIn)
         case .external:
-            guard let uuid = managedExternal?.uuid else { return Display.menuExternal(in: displays) }
-            return displays.first { !$0.isBuiltIn && $0.uuid == uuid }
+            guard let external = managedExternal, let api else { return Display.menuExternal(in: displays) }
+            return displays.first { matchesExternal($0, external, api: api) }
         }
+    }
+
+    private func matchesExternal(_ display: Display, _ external: ManagedExternal, api: DisplayConnectionAPI) -> Bool {
+        guard !display.isBuiltIn else { return false }
+        if display.uuid == external.uuid { return true }
+        guard let edid = external.hardware.edidUUID, let hardware = api.externalHardware(display.id) else { return false }
+        return hardware.location == external.hardware.location && hardware.edidUUID == edid
     }
 
     private func usableBuiltIn(in displays: [Display]) -> NSScreen? {
@@ -259,20 +342,21 @@ final class DisplayConnection: ObservableObject {
         }
 
         let active = displays.flatMap { activeTarget(in: $0) }
-        if let displays, active == nil, let external = managedExternal {
-            if api.isExternalAttached(at: external.location) {
-                // Verify that this registry entry survives soft disconnection before using its loss as evidence.
-                managedExternal?.wasAttachedWhileInactive = true
-            } else if external.wasAttachedWhileInactive,
-                      api.isExternalMissing(uuid: external.uuid, originalID: external.id) {
-                finish()
-                message = nil
-                refreshExternalAvailability(displays: displays, lidClosed: closed, api: api)
-                return
+        let now = Date()
+        if target == .external {
+            if let displays, let external = managedExternal {
+                if active == nil, observeExternalAttachment(external, api: api, now: now) {
+                    if phase == nil {
+                        refreshExternalAvailability(displays: displays, lidClosed: closed, api: api)
+                    }
+                    return
+                }
+            } else if managedExternal == nil, !pendingExternals.isEmpty {
+                startMonitoring()
+                if let displays, resumePendingExternal(in: displays, api: api, now: now) { return }
             }
         }
         let hasSurvivor = displays.map { hasSurvivor(in: $0, api: api) }
-        let now = Date()
         if target == .external, closed != false {
             switch phase {
             case .disconnecting, .trial, .disconnected:
@@ -367,10 +451,91 @@ final class DisplayConnection: ObservableObject {
         }
     }
 
+    private func observeExternalAttachment(_ external: ManagedExternal, api: DisplayConnectionAPI, now: Date) -> Bool {
+        if api.isExternalAttached(external.hardware) {
+            // A new hardware service also detects a replug that finished between samples.
+            let link = api.externalLinkID(external.hardware)
+            if let link {
+                let previous = externalLinkID
+                externalLinkID = link
+                if let previous, link != previous {
+                    switch phase {
+                    case .trial, .disconnected, .recoveryFailed:
+                        beginRecovery(api, now: now)
+                        return true
+                    default:
+                        break
+                    }
+                }
+            }
+            wasAttachedWhileInactive = true
+        } else if wasAttachedWhileInactive,
+                  external.hardware.edidUUID != nil || api.isExternalMissing(uuid: external.uuid, originalID: external.id) {
+            finish(forgetExternal: false)
+            message = nil
+            startMonitoring()
+            return true
+        }
+        return false
+    }
+
+    private func resumePendingExternal(in displays: [Display], api: DisplayConnectionAPI, now: Date) -> Bool {
+        let outstanding = pendingExternals.filter { external in
+            !displays.contains { matchesExternal($0, external, api: api) }
+        }
+        if outstanding.count != pendingExternals.count {
+            try? savePendingExternals(outstanding)
+        }
+        guard let external = outstanding.first(where: {
+            api.isExternalAttached($0.hardware) && api.externalRecoveryID(uuid: $0.uuid, hardware: $0.hardware) != nil
+        }) else {
+            if outstanding.isEmpty { stopMonitoring() }
+            return false
+        }
+        managedExternal = external
+        beginRecovery(api, now: now)
+        return true
+    }
+
+    private func savePendingExternals(_ records: [ManagedExternal]) throws {
+        if records.isEmpty {
+            defaults.removeObject(forKey: Self.recoveryKey)
+        } else {
+            let data = try PropertyListEncoder().encode(records)
+            defaults.set(data, forKey: Self.recoveryKey)
+        }
+        pendingExternals = records
+    }
+
+    func prepareExternalRecoveryOnQuit() -> Bool {
+        guard target == .external else { return false }
+        refresh()
+        guard let external = managedExternal, let api else { return false }
+        return api.isExternalAttached(external.hardware)
+    }
+
+    func waitForExternalRecoveryOnQuit() async {
+        guard let api, managedExternal != nil else { return }
+        if let displays = try? Display.active(), activeTarget(in: displays) != nil {
+            finishRecovery()
+            return
+        }
+        let deadline = ContinuousClock.now + .seconds(Self.recoveryDuration)
+        switch phase {
+        case .reconnecting:
+            break
+        default:
+            beginRecovery(api, now: Date())
+        }
+        while ContinuousClock.now < deadline, case .reconnecting = phase {
+            do { try await Task.sleep(for: .milliseconds(100)) } catch { return }
+        }
+    }
+
     private func refreshExternalAvailability(
         displays: [Display]?, lidClosed: Bool?, api: DisplayConnectionAPI
     ) {
-        if managedExternal != nil {
+        if isManaged {
             updateState(.disconnected)
         } else if lidClosed != false {
             updateState(.unavailable("请打开 MacBook 上盖。"))
@@ -389,17 +554,24 @@ final class DisplayConnection: ObservableObject {
     func disconnect(expectedExternalUUID: String? = nil) {
         let displays = try? Display.active()
         refresh(displays: displays)
-        guard state == .connected, let api, let displays, let display = activeTarget(in: displays) else { return }
+        guard state == .connected, let api, let displays else { return }
+        let candidate = target == .external ? Display.menuExternal(in: displays) : activeTarget(in: displays)
+        guard let display = candidate else { return }
         let external: ManagedExternal?
         if target == .external {
             guard let uuid = display.uuid, uuid == expectedExternalUUID,
-                  let location = api.physicalExternalLocation(display.id) else { return }
-            external = ManagedExternal(id: display.id, uuid: uuid, name: display.name, location: location)
+                  let hardware = api.externalHardware(display.id) else { return }
+            external = ManagedExternal(id: display.id, uuid: uuid, name: display.name, hardware: hardware)
         } else {
             external = nil
         }
         message = nil
+        let previous = pendingExternals
         do {
+            if let external {
+                let other = previous.filter { $0.uuid != external.uuid }
+                try savePendingExternals(other + [external])
+            }
             try api.setEnabled(false, id: display.id, externalUUID: external?.uuid)
             if let external {
                 managedExternal = external
@@ -411,6 +583,7 @@ final class DisplayConnection: ObservableObject {
             startMonitoring()
             refresh()
         } catch {
+            if external != nil { try? savePendingExternals(previous) }
             message = error.localizedDescription
         }
     }
@@ -452,9 +625,9 @@ final class DisplayConnection: ObservableObject {
         phase = .reconnecting(deadline: deadline, nextAttempt: now.addingTimeInterval(Self.retryInterval))
         updateState(.switching)
         if target == .external {
-            guard let uuid = managedExternal?.uuid, let id = api.externalID(uuid: uuid) else { return }
+            guard let external = managedExternal else { return }
             // The monitor retries until the recovery deadline.
-            try? api.setEnabled(true, id: id, externalUUID: uuid)
+            try? api.restoreExternal(uuid: external.uuid, hardware: external.hardware)
             return
         }
         let original = managedID.flatMap { CGDisplayIsBuiltin($0) != 0 ? $0 : nil }
@@ -466,27 +639,38 @@ final class DisplayConnection: ObservableObject {
     }
 
     func restoreOnQuit() {
-        guard managedID != nil || managedExternal != nil else { return }
+        guard managedID != nil else { return }
         reconnect()
         stopMonitoring()
+    }
+
+    private var monitorInterval: Duration {
+        if target == .external, phase == nil { return .seconds(2) }
+        return .milliseconds(500)
     }
 
     private func startMonitoring() {
         guard monitor == nil else { return }
         monitor = Task { [weak self] in
             while !Task.isCancelled {
-                do { try await Task.sleep(for: .milliseconds(500)) } catch { return }
+                guard let interval = self?.monitorInterval else { return }
+                do { try await Task.sleep(for: interval) } catch { return }
                 guard let self else { return }
                 self.refresh()
             }
         }
     }
 
-    private func finish() {
+    private func finish(forgetExternal: Bool = true) {
+        if forgetExternal, let external = managedExternal {
+            try? savePendingExternals(pendingExternals.filter { $0.uuid != external.uuid })
+        }
         managedID = nil
         managedExternal = nil
+        externalLinkID = nil
+        wasAttachedWhileInactive = false
         phase = nil
-        stopMonitoring()
+        if pendingExternals.isEmpty { stopMonitoring() }
     }
 
     private func finishRecovery(_ notice: String? = nil) {

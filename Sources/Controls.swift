@@ -8,6 +8,7 @@ private typealias ViewState<Value> = SwiftUI.State<Value>
 struct Controls: View {
     @ObservedObject var model: Model
     @ObservedObject var external: DisplayConnection
+    let toggleConnection: (DisplayConnection.Target) -> Void
 
     var body: some View {
         TabView {
@@ -83,10 +84,11 @@ struct Controls: View {
             }
             .id(model.selectedDisplayID)
 
-            BuiltInDisplayControls(
-                display: model.builtIn, disconnectDisabled: model.modeTrial != nil || external.isManaged,
-                disconnect: model.disconnectBuiltIn
-            )
+            Section("显示器连接") {
+                DisplayConnectionControls(
+                    model: model, builtIn: model.builtIn, external: external, toggleConnection: toggleConnection
+                )
+            }
             Section("显示模式") {
                 if let display = model.selectedDisplay {
                     let active = display.currentMode.map(DisplayMode.init)
@@ -233,33 +235,6 @@ private struct LoginLaunchControls: View {
             }
         } catch {
             errorMessage = error.localizedDescription
-        }
-    }
-}
-
-private struct BuiltInDisplayControls: View {
-    @ObservedObject var display: DisplayConnection
-    let disconnectDisabled: Bool
-    let disconnect: () -> Void
-
-    var body: some View {
-        Section("开盖使用外屏") {
-            switch display.state {
-            case .connected:
-                Button("断开 MacBook 内建屏", action: disconnect)
-                    .disabled(disconnectDisabled)
-                Text("断开后请在外屏确认。未确认时将尝试恢复内建屏。")
-                    .foregroundStyle(.secondary)
-            case .disconnected:
-                Button("重新连接内建屏") { display.reconnect() }
-            case .switching, .trial:
-                ProgressView("正在检查内建屏连接").controlSize(.small)
-            case .unavailable(let reason):
-                Text(reason).foregroundStyle(.secondary)
-            }
-            if let message = display.message {
-                Text(message).foregroundStyle(.secondary)
-            }
         }
     }
 }

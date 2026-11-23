@@ -257,7 +257,6 @@ final class Model: ObservableObject {
     }
 
     func shutDown() {
-        external.restoreOnQuit()
         builtIn.restoreOnQuit()
         revertMode()
     }

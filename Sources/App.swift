@@ -11,6 +11,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var confirmationPanel: NSPanel?
     private var confirmationConnection: DisplayConnection?
     private var connectionObserver: AnyCancellable?
+    private var quitRecoveryTask: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -25,8 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
             model: model,
             builtIn: model.builtIn,
             external: model.external,
-            toggleBuiltIn: { [weak self] in self?.toggleConnection(.builtIn) },
-            toggleExternal: { [weak self] in self?.toggleConnection(.external) },
+            toggleConnection: { [weak self] in self?.toggleConnection($0) },
             showSettings: { [weak self] in self?.showControls() },
             quit: { NSApp.terminate(nil) }
         ))
@@ -57,6 +57,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showControls()
         return false
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if quitRecoveryTask != nil { return .terminateLater }
+        guard model.external.prepareExternalRecoveryOnQuit() else { return .terminateNow }
+        quitRecoveryTask = Task {
+            await model.external.waitForExternalRecoveryOnQuit()
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -152,7 +162,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     private func showControls() {
         statusPopover.close()
-        model.builtIn.refresh()
+        model.refreshDisplays()
         if controlWindow == nil {
             let window = NSWindow(
                 contentRect: CGRect(x: 0, y: 0, width: 560, height: 440),
@@ -161,7 +171,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 defer: false
             )
             window.title = "MacDisplay"
-            window.contentViewController = NSHostingController(rootView: Controls(model: model, external: model.external))
+            window.contentViewController = NSHostingController(rootView: Controls(
+                model: model, external: model.external,
+                toggleConnection: { [weak self] in self?.toggleConnection($0) }
+            ))
             window.isReleasedWhenClosed = false
             window.center()
             controlWindow = window
